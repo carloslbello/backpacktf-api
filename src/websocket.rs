@@ -1,4 +1,5 @@
 use crate::response::listing::Listing;
+use crate::time::ServerTime;
 use tokio_tungstenite::{tungstenite, connect_async};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,7 @@ enum EventType {
 
 #[derive(Deserialize, Debug)]
 struct EventMessage<'a> {
+    id: &'a str,
     event: EventType,
     #[serde(borrow)]
     payload: &'a RawValue,
@@ -63,7 +65,7 @@ pub fn generate_key() -> String {
     data_encoding::BASE64.encode(&r)
 }
 
-pub async fn connect() -> Result<mpsc::Receiver<Message>, Error> {
+pub async fn connect() -> Result<mpsc::Receiver<(ServerTime, Message)>, Error> {
     let connect_addr = "wss://ws.backpack.tf/events";
     let uri = connect_addr.parse::<Uri>()?;
     let authority = uri.authority()
@@ -82,16 +84,16 @@ pub async fn connect() -> Result<mpsc::Receiver<Message>, Error> {
         .uri(uri)
         .body(())?;
     let (ws_stream, _) = connect_async(request).await?;
-    let (write, read) = mpsc::channel::<Message>(100);
+    let (write, read) = mpsc::channel::<(ServerTime, Message)>(100);
     let (_ws_write, mut ws_read) = ws_stream.split();
-    
+
     tokio::spawn(async move {
         while let Some(message) = ws_read.next().await {
             match message {
                 Ok(message) => {
                     let data = message.into_data();
                     let bytes = data.as_slice();
-                    
+
                     match serde_json::from_slice::<Vec<EventMessage>>(bytes) {
                         Ok(messages) => {
                             for message in messages {
@@ -102,6 +104,13 @@ pub async fn connect() -> Result<mpsc::Receiver<Message>, Error> {
                                                 "Error deserializing event payload: {} {}",
                                                 error,
                                                 message.payload,
+                                            );
+                                        },
+                                        EventError::HexDecode(error) => {
+                                            log::debug!(
+                                                "Error hex decoding event id: {} {}",
+                                                error,
+                                                message.id
                                             );
                                         },
                                         // connection likely dropped
@@ -140,49 +149,71 @@ pub async fn connect() -> Result<mpsc::Receiver<Message>, Error> {
                 },
             }
         }
-        
+
         drop(write);
     });
-    
+
     Ok(read)
 }
 
 #[derive(thiserror::Error, Debug)]
 enum EventError {
     #[error("{}", .0)]
-    Send(#[from] tokio::sync::mpsc::error::SendError<Message>),
+    Send(#[from] tokio::sync::mpsc::error::SendError<(ServerTime, Message)>),
     #[error("{}", .0)]
     Serde(#[from] serde_json::Error),
+    #[error("{}", .0)]
+    HexDecode(#[from] data_encoding::DecodeError),
 }
 
 async fn on_event<'a>(
     message: &EventMessage<'a>,
-    write: &mpsc::Sender<Message>,
+    write: &mpsc::Sender<(ServerTime, Message)>,
 ) -> Result<(), EventError> {
+    let event_time: ServerTime = ServerTime::from_timestamp(
+        u32::from_be_bytes(
+            data_encoding::HEXLOWER.decode(
+                message.id.as_bytes()
+            )?
+            [..4].try_into().unwrap()
+        ).into(),
+        0
+    ).unwrap();
+
     match message.event {
         EventType::ListingUpdate |
         EventType::ListingDelete => {
             match serde_json::from_str::<Listing>(message.payload.get()) {
                 Ok(listing) => {
-                    write.send(match message.event {
-                        EventType::ListingUpdate => Message::ListingUpdate(listing),
-                        EventType::ListingDelete => Message::ListingDelete(listing),
-                    }).await?;
+                    write.send(
+                        (
+                            event_time,
+                            match message.event {
+                                EventType::ListingUpdate => Message::ListingUpdate(listing),
+                                EventType::ListingDelete => Message::ListingDelete(listing),
+                            },
+                        )
+                    ).await?;
                 },
                 Err(error) => if let Ok(AppType { appid }) = serde_json::from_str::<AppType>(message.payload.get()) {
                     if appid != APPID_TEAM_FORTRESS_2 {
                         let payload = message.payload.to_owned();
-                        
-                        write.send(match message.event {
-                            EventType::ListingUpdate => Message::ListingUpdateOtherApp {
-                                appid,
-                                payload,
-                            },
-                            EventType::ListingDelete => Message::ListingDeleteOtherApp {
-                                appid,
-                                payload,
-                            },
-                        }).await?;
+
+                        write.send(
+                            (
+                                event_time,
+                                match message.event {
+                                    EventType::ListingUpdate => Message::ListingUpdateOtherApp {
+                                        appid,
+                                        payload,
+                                    },
+                                    EventType::ListingDelete => Message::ListingDeleteOtherApp {
+                                        appid,
+                                        payload,
+                                    },
+                                }
+                            )
+                        ).await?;
                     } else {
                         return Err(error.into());
                     }
@@ -190,7 +221,7 @@ async fn on_event<'a>(
                     return Err(error.into());
                 },
             }
-            
+
             Ok(())
         },
     }
